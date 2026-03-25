@@ -83,8 +83,15 @@ void setScrollingText();
 
 void handleRoot();
 void handleSetMessage();
+void updateNeopixel(); 
+bool checkButton(ButtonState &btn);
+void saveSettings();
+void refreshClockDisplay(struct tm* currentTime);
+void startAlarm();
+void stopAlarm();
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   delay(100);
 
@@ -142,7 +149,7 @@ void setup() {
   // initialize time from NTP with retry
   setupNTPTime();
 }
-}
+
 
 void loop() {
   server.handleClient();
@@ -240,12 +247,10 @@ void setupWebServer() {
 }
 
 void setupNTPTime() {
-  // Configure NTP with multiple servers for better reliability
+  // Configure NTP with two servers (ESP32 configTime supports up to 3 args)
   configTime(gmtOffsetSec, daylightOffsetSec,
              "pool.ntp.org",
-             "time.nist.gov",
-             "time.google.com",
-             "ntp.ubuntu.com");
+             "time.nist.gov");
 
   Serial.println("Attempting NTP synchronization...");
 
