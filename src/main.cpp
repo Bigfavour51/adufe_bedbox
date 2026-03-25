@@ -78,13 +78,8 @@ ButtonState btnNeo = {BTN_NEOPIXEL, HIGH, HIGH, 0};
 // ----- forward declarations -----
 void setupWiFi();
 void setupWebServer();
+void setupNTPTime();
 void setScrollingText();
-void refreshClockDisplay(struct tm* currentTime);
-void startAlarm();
-void stopAlarm();
-void updateNeopixel();
-void saveSettings();
-bool checkButton(ButtonState &btn);
 
 void handleRoot();
 void handleSetMessage();
@@ -124,8 +119,17 @@ void setup() {
   neopixelOn = prefs.getBool("neopixelOn", false);
   scrollText = prefs.getString("scrollText", scrollText);
 
-  String ssidS = prefs.getString("ssid", default_ssid);
-  String passS = prefs.getString("password", default_password);
+  // Load WiFi credentials, save defaults if not exist
+  String ssidS = prefs.getString("ssid", "");
+  String passS = prefs.getString("password", "");
+  if (ssidS.length() == 0) {
+    // First run - save defaults
+    prefs.putString("ssid", default_ssid);
+    prefs.putString("password", default_password);
+    ssidS = default_ssid;
+    passS = default_password;
+    Serial.println("Saved default WiFi credentials");
+  }
   ssidS.toCharArray(saved_ssid, sizeof(saved_ssid));
   passS.toCharArray(saved_password, sizeof(saved_password));
 
@@ -135,14 +139,9 @@ void setup() {
   setupWiFi();
   setupWebServer();
 
-  // initialize time from NTP if possible
-  configTime(gmtOffsetSec, daylightOffsetSec, "pool.ntp.org", "time.nist.gov");
-  struct tm timeInfo;
-  if (!getLocalTime(&timeInfo, 5000)) {
-    Serial.println("Failed to get time from NTP");
-  } else {
-    Serial.println("Time synchronized");
-  }
+  // initialize time from NTP with retry
+  setupNTPTime();
+}
 }
 
 void loop() {
@@ -238,6 +237,50 @@ void setupWebServer() {
   server.on("/set", HTTP_POST, handleSetMessage);
   server.onNotFound([]() { server.send(404, "text/plain", "Not Found"); });
   server.begin();
+}
+
+void setupNTPTime() {
+  // Configure NTP with multiple servers for better reliability
+  configTime(gmtOffsetSec, daylightOffsetSec,
+             "pool.ntp.org",
+             "time.nist.gov",
+             "time.google.com",
+             "ntp.ubuntu.com");
+
+  Serial.println("Attempting NTP synchronization...");
+
+  // Try multiple times with increasing timeout
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("NTP attempt %d/3...\n", attempt);
+
+    struct tm timeInfo;
+    if (getLocalTime(&timeInfo, 10000)) {  // 10 second timeout
+      Serial.println("NTP synchronization successful!");
+      Serial.printf("Current time: %02d:%02d:%02d\n",
+                   timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+      return;
+    }
+
+    Serial.printf("NTP attempt %d failed, retrying...\n", attempt);
+    delay(2000);  // Wait 2 seconds before retry
+  }
+
+  Serial.println("All NTP attempts failed. Clock will use ESP32 internal time.");
+  Serial.println("Time will be inaccurate until NTP connection is restored.");
+
+  // Set a default time if NTP completely fails
+  struct tm defaultTime = {0};
+  defaultTime.tm_year = 124;  // 2024 - 1900
+  defaultTime.tm_mon = 0;     // January
+  defaultTime.tm_mday = 1;    // 1st
+  defaultTime.tm_hour = 12;   // Noon
+  defaultTime.tm_min = 0;
+  defaultTime.tm_sec = 0;
+  time_t defaultTimeT = mktime(&defaultTime);
+  struct timeval tv = {defaultTimeT, 0};
+  settimeofday(&tv, NULL);
+
+  Serial.println("Set default time: 2024-01-01 12:00:00");
 }
 
 void handleRoot() {
