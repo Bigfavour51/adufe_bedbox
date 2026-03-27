@@ -26,6 +26,7 @@
 // NeoPixel
 #define NEOPIXEL_PIN 16
 #define NEOPIXEL_COUNT 27
+#define NEOPIXEL_BRIGHTNESS 50  // 0-255, reduced to avoid brownout (27 LEDs @ full white = 1.6A!)
 
 // Buzzer (active HIGH)
 #define BUZZER_PIN 25
@@ -36,8 +37,8 @@ const char* default_password = "INNOV8HUB";
 char saved_ssid[64] = "";
 char saved_password[64] = "";
 
-const long  gmtOffsetSec = 0;
-const int   daylightOffsetSec = 0;
+const long  gmtOffsetSec = 1 * 3600;   // UTC+1 (West Africa Time - Lagos)
+const int   daylightOffsetSec = 0;    // No daylight saving in Nigeria
 
 WebServer server(80);
 
@@ -90,7 +91,7 @@ void refreshClockDisplay(struct tm* currentTime);
 void startAlarm();
 void stopAlarm();
 
-void setup()
+void setup()    
 {
   Serial.begin(115200);
   delay(100);
@@ -116,6 +117,7 @@ void setup()
 
   // NeoPixel
   strip.begin();
+  strip.setBrightness(NEOPIXEL_BRIGHTNESS);
   strip.show();
 
   // settings
@@ -149,7 +151,6 @@ void setup()
   // initialize time from NTP with retry
   setupNTPTime();
 }
-
 
 void loop() {
   server.handleClient();
@@ -348,7 +349,8 @@ void stopAlarm() {
 void updateNeopixel() {
   if (neopixelOn) {
     for (int i = 0; i < NEOPIXEL_COUNT; i++) {
-      strip.setPixelColor(i, strip.Color(255, 255, 255));
+      // Use soft yellow for testing (lower current than white)
+      strip.setPixelColor(i, strip.Color(200, 150, 0));
     }
   } else {
     for (int i = 0; i < NEOPIXEL_COUNT; i++) {
