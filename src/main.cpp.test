@@ -1,0 +1,58 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+// ===== MATRIX CONFIG =====
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4
+#define CS_PIN 5
+
+MD_Parola display = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+
+// ===== RTC CONFIG =====
+RTC_DS3231 rtc;
+
+void setup() {
+  Serial.begin(115200);
+
+  // I2C for RTC
+  Wire.begin(21, 22);
+
+  // Init RTC
+  if (!rtc.begin()) {
+    Serial.println("RTC not found!");
+    while (1);
+  }
+
+  // ===== SET TIME FROM COMPILE TIME =====
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // ===== DISPLAY SETUP =====
+  display.begin();
+  display.setIntensity(5);
+  display.displayClear();
+}
+
+void loop() {
+  DateTime now = rtc.now();
+
+  char timeStr[6];
+
+  // Blinking colon effect
+  if (now.second() % 2 == 0)
+    sprintf(timeStr, "%02d:%02d", now.hour(), now.minute());
+  else
+    sprintf(timeStr, "%02d %02d", now.hour(), now.minute());
+
+  display.displayText(timeStr, PA_CENTER, 100, 0, PA_PRINT, PA_NO_EFFECT);
+  display.displayAnimate();
+
+  // Debug
+  Serial.print("Time: ");
+  Serial.println(timeStr);
+
+  delay(1000);
+}

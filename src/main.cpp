@@ -6,16 +6,16 @@
 #include <SPI.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
-#include <time.h>
+#include <Wire.h>
+#include <RTClib.h>
 
-// ----- PIN CONFIG -----
+// ===== HARDWARE CONFIG =====
+// MAX7219
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 8t
+#define CS_PIN 5
 
-// MAX7219 chains
-#define MAX_DEVICES 4
-#define CLK_PIN 18
-#define DIN_PIN 23
-#define CS_CLOCK 5
-#define CS_MESSAGE 17
+MD_Parola display = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 
 // Buttons (pullup, active LOW)
 #define BTN_HOUR 32
@@ -26,30 +26,26 @@
 // NeoPixel
 #define NEOPIXEL_PIN 16
 #define NEOPIXEL_COUNT 27
-#define NEOPIXEL_BRIGHTNESS 50  // 0-255, reduced to avoid brownout (27 LEDs @ full white = 1.6A!)
+#define NEOPIXEL_BRIGHTNESS 20
 
-// Buzzer (active HIGH)
+// Buzzer
 #define BUZZER_PIN 25
 
-// ----- WIFI / TIME -----
+// WiFi defaults
 const char* default_ssid = "ICT";
 const char* default_password = "INNOV8HUB";
 char saved_ssid[64] = "";
 char saved_password[64] = "";
 
-const long  gmtOffsetSec = 1 * 3600;   // UTC+1 (West Africa Time - Lagos)
-const int   daylightOffsetSec = 0;    // No daylight saving in Nigeria
-
 WebServer server(80);
 
-// ----- displays -----
-MD_Parola clockDisplay(MD_MAX72XX::FC16_HW, CS_CLOCK, MAX_DEVICES);
-MD_Parola msgDisplay(MD_MAX72XX::FC16_HW, CS_MESSAGE, MAX_DEVICES);
+// Lagos timezone UTC+1
+const int TIMEZONE_OFFSET_HOURS = 1;
 
-Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-Preferences prefs;
+// RTC
+RTC_DS3231 rtc;
 
-// ----- state -----
+// ===== STATE =====
 int alarmHour = 7;
 int alarmMinute = 0;
 bool alarmEnabled = false;
@@ -62,7 +58,9 @@ unsigned long alarmStartMillis = 0;
 unsigned long buzzerToggleMillis = 0;
 bool buzzerState = false;
 
-unsigned long lastClockUpdateMillis = 0;
+int lastHour = -1;
+int lastMinute = -1;
+int lastSecond = -1;
 
 struct ButtonState {
   uint8_t pin;
@@ -76,51 +74,50 @@ ButtonState btnMinute = {BTN_MINUTE, HIGH, HIGH, 0};
 ButtonState btnAlarm = {BTN_ALARM, HIGH, HIGH, 0};
 ButtonState btnNeo = {BTN_NEOPIXEL, HIGH, HIGH, 0};
 
-// ----- forward declarations -----
+// NeoPixel
+Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+Preferences prefs;
+
+// ===== FORWARD DECLARATIONS =====
 void setupWiFi();
 void setupWebServer();
-void setupNTPTime();
+void setupRTC();
 void setScrollingText();
-
-void handleRoot();
-void handleSetMessage();
-void updateNeopixel(); 
+void updateNeopixel();
 bool checkButton(ButtonState &btn);
 void saveSettings();
-void refreshClockDisplay(struct tm* currentTime);
 void startAlarm();
 void stopAlarm();
 
-void setup()    
-{
+// ===== SETUP =====
+void setup() {
   Serial.begin(115200);
   delay(100);
+  Serial.println("ESP32 BedBox Starting...");
 
-  // display init
-  clockDisplay.begin();
-  clockDisplay.setIntensity(2);
-  clockDisplay.displayClear();
-
-  msgDisplay.begin();
-  msgDisplay.setIntensity(2);
-  msgDisplay.displayClear();
-
-  // buzzer
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-
-  // buttons
-  pinMode(BTN_HOUR, INPUT_PULLUP);
-  pinMode(BTN_MINUTE, INPUT_PULLUP);
-  pinMode(BTN_ALARM, INPUT_PULLUP);
-  pinMode(BTN_NEOPIXEL, INPUT_PULLUP);
+  // Display init with zones
+  display.begin(1); // 2 zones
+  display.setZone(0, 0, 3); // Clock → first 4 modules
+  display.setZone(1, 4, 7); // Message → last 4 modules
+  display.setIntensity(5);
+  display.displayClear();
 
   // NeoPixel
   strip.begin();
   strip.setBrightness(NEOPIXEL_BRIGHTNESS);
   strip.show();
 
-  // settings
+  // Buttons
+  pinMode(BTN_HOUR, INPUT_PULLUP);
+  pinMode(BTN_MINUTE, INPUT_PULLUP);
+  pinMode(BTN_ALARM, INPUT_PULLUP);
+  pinMode(BTN_NEOPIXEL, INPUT_PULLUP);
+
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Preferences
   prefs.begin("bedbox", false);
   alarmHour = prefs.getUInt("alarmHour", 7);
   alarmMinute = prefs.getUInt("alarmMinute", 0);
@@ -128,11 +125,10 @@ void setup()
   neopixelOn = prefs.getBool("neopixelOn", false);
   scrollText = prefs.getString("scrollText", scrollText);
 
-  // Load WiFi credentials, save defaults if not exist
+  // WiFi
   String ssidS = prefs.getString("ssid", "");
   String passS = prefs.getString("password", "");
   if (ssidS.length() == 0) {
-    // First run - save defaults
     prefs.putString("ssid", default_ssid);
     prefs.putString("password", default_password);
     ssidS = default_ssid;
@@ -142,220 +138,164 @@ void setup()
   ssidS.toCharArray(saved_ssid, sizeof(saved_ssid));
   passS.toCharArray(saved_password, sizeof(saved_password));
 
-  updateNeopixel();
+  // Start scrolling message
   setScrollingText();
+  updateNeopixel();
 
+  // I2C for RTC
+  Wire.begin(21, 22);
+
+  // WiFi
   setupWiFi();
-  setupWebServer();
 
-  // initialize time from NTP with retry
-  setupNTPTime();
+  // RTC
+  setupRTC();
+
+  DateTime now = rtc.now();
+  Serial.printf("RTC initialized to: %04d-%02d-%02d %02d:%02d:%02d\n", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
 }
 
+// ===== LOOP =====
 void loop() {
-  server.handleClient();
+  static bool wifiConnected = false;
+  static bool webServerStarted = false;
 
-  unsigned long now = millis();
-
-  if (checkButton(btnHour)) {
-    alarmHour = (alarmHour + 1) % 24;
-    saveSettings();
-  }
-  if (checkButton(btnMinute)) {
-    alarmMinute = (alarmMinute + 1) % 60;
-    saveSettings();
-  }
-  if (checkButton(btnAlarm)) {
-    alarmEnabled = !alarmEnabled;
-    saveSettings();
-  }
-  if (checkButton(btnNeo)) {
-    neopixelOn = !neopixelOn;
-    saveSettings();
-    updateNeopixel();
-  }
-
-  struct tm currentTime;
-  if (getLocalTime(&currentTime, 1000)) {
-    if (!alarmActive && (now - lastClockUpdateMillis >= 1000)) {
-      refreshClockDisplay(&currentTime);
-      lastClockUpdateMillis = now;
+  // WiFi & web server
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+      Serial.println("WiFi connected!");
+      Serial.print("IP address: "); Serial.println(WiFi.localIP());
     }
-
-    if (alarmEnabled && !alarmActive
-        && currentTime.tm_hour == alarmHour
-        && currentTime.tm_min == alarmMinute
-        && currentTime.tm_sec == 0) {
-      startAlarm();
+    if (!webServerStarted) {
+      setupWebServer();
+      webServerStarted = true;
+      Serial.println("Web server started");
     }
-
-    if (alarmActive) {
-      if (now - alarmStartMillis >= 60000) {
-        stopAlarm();
-      } else {
-        if (now - buzzerToggleMillis >= 200) {
-          buzzerToggleMillis = now;
-          buzzerState = !buzzerState;
-          digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
-        }
-        if (!clockDisplay.displayAnimate()) {
-          clockDisplay.displayText("ALARM", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-        }
-      }
-    }
+    server.handleClient();
+  } else if (wifiConnected || webServerStarted) {
+    Serial.println("WiFi disconnected, restarting AP mode");
+    webServerStarted = false;
+    wifiConnected = false;
+    setupWiFi();
   }
 
-  if (alarmActive == false) {
-    // keep clock display running and not in alarm mode
-    clockDisplay.displayAnimate();
+  // Buttons
+  if (checkButton(btnHour)) { alarmHour = (alarmHour + 1) % 24; saveSettings(); }
+  if (checkButton(btnMinute)) { alarmMinute = (alarmMinute + 1) % 60; saveSettings(); }
+  if (checkButton(btnAlarm)) { alarmEnabled = !alarmEnabled; saveSettings(); }
+  if (checkButton(btnNeo)) { neopixelOn = !neopixelOn; saveSettings(); updateNeopixel(); }
+
+  // Clock
+  DateTime nowDT = rtc.now();
+  DateTime localDT = nowDT + TimeSpan(TIMEZONE_OFFSET_HOURS * 3600);
+  int hour = localDT.hour();
+  int minute = localDT.minute();
+  int second = localDT.second();
+
+  // Alarm trigger
+  if (alarmEnabled && !alarmActive && hour == alarmHour && minute == alarmMinute && second == 0) {
+    startAlarm();
   }
 
-  msgDisplay.displayAnimate();
+  // Alarm active
+  if (alarmActive) {
+    unsigned long nowMillis = millis();
+    if (nowMillis - alarmStartMillis >= 60000) stopAlarm();
+    else if (nowMillis - buzzerToggleMillis >= 200) {
+      buzzerToggleMillis = nowMillis;
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+    if (!display.displayAnimate()) {
+      display.displayZoneText(0, "ALARM", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    }
+  } else {
+    bool colon = (second % 2 == 0);
+    if (hour != lastHour || minute != lastMinute || second != lastSecond) {
+      lastHour = hour;
+      lastMinute = minute;
+      lastSecond = second;
+
+      char timeStr[6];
+      sprintf(timeStr, colon ? "%02d:%02d" : "%02d %02d", hour, minute);
+      display.displayZoneText(0, timeStr, PA_CENTER, 50, 0, PA_PRINT, PA_NO_EFFECT);
+    }
+    display.displayAnimate();
+  }
+
+  // Animate message zone
+  if (display.displayAnimate()) display.displayReset();
 }
 
+// ===== FUNCTIONS =====
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
-
+  WiFi.setAutoReconnect(true);
   if (strlen(saved_ssid) > 0) {
-    Serial.printf("Connecting to STA %s\n", saved_ssid);
+    Serial.printf("Attempting STA connect to %s\n", saved_ssid);
     WiFi.begin(saved_ssid, saved_password);
-    unsigned long startAttemptTime = millis();
-
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
-      delay(200);
-      Serial.print(".");
+    unsigned long start = millis();
+    while (millis() - start < 10000) {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+        return;
+      }
+      delay(250);
+      yield();
     }
-    Serial.println();
   }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Connected. IP: %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("WiFi STA failed, starting AP mode");
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("adufe_bedbox", "12345678");
-    IPAddress apIP(192,168,4,1);
-    WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
-    Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-  }
+  Serial.println("STA failed, starting AP");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("adufe_bedbox", "12345678");
+  IPAddress apIP(192,168,4,1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255,255,255,0));
+  Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
 }
 
 void setupWebServer() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/set", HTTP_POST, handleSetMessage);
-  server.onNotFound([]() { server.send(404, "text/plain", "Not Found"); });
+  server.on("/", HTTP_GET, [](){
+    String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>BedBox Config</title></head><body>";
+    html += "<h1>BedBox Display Config</h1>";
+    html += "<p>Scrolling text: " + scrollText + "</p>";
+    html += "<p>Alarm: " + String(alarmHour) + ":" + (alarmMinute<10?"0":"") + String(alarmMinute)
+            + (alarmEnabled?" (enabled)":" (disabled)") + "</p>";
+    html += "<form method=\"POST\" action=\"/set\">";
+    html += "Message: <input name=\"message\" type=\"text\" value=\"" + scrollText + "\" size=\"22\"><br><br>";
+    html += "<input type=\"submit\" value=\"Save message\">";
+    html += "</form></body></html>";
+    server.send(200, "text/html", html);
+  });
+  server.on("/set", HTTP_POST, [](){
+    if (server.hasArg("message")) {
+      String msg = server.arg("message");
+      if (msg.length() == 0) msg = " ";
+      scrollText = msg;
+      prefs.putString("scrollText", scrollText);
+      setScrollingText();
+    }
+    server.sendHeader("Location","/",true);
+    server.send(303,"text/plain","");
+  });
+  server.onNotFound([](){ server.send(404,"text/plain","Not Found"); });
   server.begin();
 }
 
-void setupNTPTime() {
-  // Configure NTP with two servers (ESP32 configTime supports up to 3 args)
-  configTime(gmtOffsetSec, daylightOffsetSec,
-             "pool.ntp.org",
-             "time.nist.gov");
-
-  Serial.println("Attempting NTP synchronization...");
-
-  // Try multiple times with increasing timeout
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    Serial.printf("NTP attempt %d/3...\n", attempt);
-
-    struct tm timeInfo;
-    if (getLocalTime(&timeInfo, 10000)) {  // 10 second timeout
-      Serial.println("NTP synchronization successful!");
-      Serial.printf("Current time: %02d:%02d:%02d\n",
-                   timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
-      return;
-    }
-
-    Serial.printf("NTP attempt %d failed, retrying...\n", attempt);
-    delay(2000);  // Wait 2 seconds before retry
-  }
-
-  Serial.println("All NTP attempts failed. Clock will use ESP32 internal time.");
-  Serial.println("Time will be inaccurate until NTP connection is restored.");
-
-  // Set a default time if NTP completely fails
-  struct tm defaultTime = {0};
-  defaultTime.tm_year = 124;  // 2024 - 1900
-  defaultTime.tm_mon = 0;     // January
-  defaultTime.tm_mday = 1;    // 1st
-  defaultTime.tm_hour = 12;   // Noon
-  defaultTime.tm_min = 0;
-  defaultTime.tm_sec = 0;
-  time_t defaultTimeT = mktime(&defaultTime);
-  struct timeval tv = {defaultTimeT, 0};
-  settimeofday(&tv, NULL);
-
-  Serial.println("Set default time: 2024-01-01 12:00:00");
-}
-
-void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>BedBox Config</title></head><body>";
-  html += "<h1>BedBox Display Config</h1>";
-  html += "<p>Scrolling text: " + scrollText + "</p>";
-  html += "<p>Alarm: " + String(alarmHour) + ":" + (alarmMinute < 10 ? "0" : "") + String(alarmMinute)
-          + (alarmEnabled ? " (enabled)" : " (disabled)") + "</p>";
-  html += "<form method=\"POST\" action=\"/set\">";
-  html += "Message: <input name=\"message\" type=\"text\" value=\"" + scrollText + "\" size=\"22\"><br><br>";
-  html += "<input type=\"submit\" value=\"Save message\">";
-  html += "</form>";
-  html += "</body></html>";
-  server.send(200, "text/html", html);
-}
-
-void handleSetMessage() {
-  if (server.hasArg("message")) {
-    String msg = server.arg("message");
-    if (msg.length() == 0) {
-      msg = " ";
-    }
-    scrollText = msg;
-    prefs.putString("scrollText", scrollText);
-    setScrollingText();
-  }
-  server.sendHeader("Location", "/", true);
-  server.send(303, "text/plain", "");
+void setupRTC() {
+  if (!rtc.begin()) { Serial.println("RTC DS3231 not found"); while(1); }
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  Serial.println("RTC initialized to compile-time");
 }
 
 void setScrollingText() {
-  msgDisplay.displayText(scrollText.c_str(), PA_LEFT, 25, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-}
-
-void refreshClockDisplay(struct tm* currentTime) {
-  char timeString[9];
-  bool colon = ((currentTime->tm_sec % 2) == 0);
-  snprintf(timeString, sizeof(timeString), "%02d%c%02d", currentTime->tm_hour, colon ? ':' : ' ', currentTime->tm_min);
-
-  clockDisplay.displayText(timeString, PA_CENTER, 0, 0, PA_PRINT, PA_PRINT);
-}
-
-void startAlarm() {
-  alarmActive = true;
-  alarmStartMillis = millis();
-  buzzerToggleMillis = millis();
-  buzzerState = false;
-  digitalWrite(BUZZER_PIN, HIGH);
-  Serial.println("Alarm triggered!");
-  clockDisplay.displayText("ALARM", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-}
-
-void stopAlarm() {
-  alarmActive = false;
-  digitalWrite(BUZZER_PIN, LOW);
-  buzzerState = false;
-  Serial.println("Alarm stopped");
+  display.displayZoneText(1, scrollText.c_str(), PA_LEFT, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
 }
 
 void updateNeopixel() {
   if (neopixelOn) {
-    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
-      // Use soft yellow for testing (lower current than white)
-      strip.setPixelColor(i, strip.Color(200, 150, 0));
-    }
+    for (int i=0;i<NEOPIXEL_COUNT;i++) strip.setPixelColor(i, strip.Color(200,150,0));
   } else {
-    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
-      strip.setPixelColor(i, 0);
-    }
+    for (int i=0;i<NEOPIXEL_COUNT;i++) strip.setPixelColor(i,0);
   }
   strip.show();
 }
@@ -371,20 +311,30 @@ void saveSettings() {
 bool checkButton(ButtonState &btn) {
   bool raw = digitalRead(btn.pin);
   unsigned long now = millis();
-
-  if (raw != btn.lastRead) {
-    btn.lastDebounce = now;
-    btn.lastRead = raw;
-  }
-
+  if (raw != btn.lastRead) { btn.lastDebounce = now; btn.lastRead = raw; }
   if ((now - btn.lastDebounce) > 50) {
     if (raw != btn.stableState) {
       btn.stableState = raw;
-      if (btn.stableState == LOW) {
-        return true;
-      }
+      if (!btn.stableState) return true;
     }
   }
-
   return false;
+}
+
+void startAlarm() {
+  alarmActive = true;
+  alarmStartMillis = millis();
+  buzzerToggleMillis = millis();
+  buzzerState = false;
+  digitalWrite(BUZZER_PIN, HIGH);
+  Serial.println("Alarm triggered!");
+  display.displayZoneText(0, "ALARM", PA_CENTER, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+}
+
+void stopAlarm() {
+  alarmActive = false;
+  digitalWrite(BUZZER_PIN, LOW);
+  buzzerState = false;
+  lastMinute = -1; // force clock refresh
+  Serial.println("Alarm stopped");
 }
